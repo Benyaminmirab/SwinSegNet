@@ -1,0 +1,275 @@
+class BasicConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1):
+        super(BasicConv2d, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
+                              padding=padding, dilation=dilation, groups=groups, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        return self.activation(x)
+
+class RFB_Block(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(RFB_Block, self).__init__()
+
+        self.branch0 = BasicConv2d(in_channels, out_channels, kernel_size=1)
+        self.branch1 = self._make_branch(in_channels, out_channels, dilation=3)
+        self.branch2 = self._make_branch(in_channels, out_channels, dilation=5)
+        self.branch3 = self._make_branch(in_channels, out_channels, dilation=7)
+
+        self.conv_cat = BasicConv2d(4 * out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv_res = BasicConv2d(in_channels, out_channels, kernel_size=1)
+
+        # Context-aware gating
+        self.gate_fc = nn.Sequential( nn.Conv2d(out_channels, out_channels // 2, kernel_size=1),  # Bottleneck
+            nn.ReLU(inplace=True), nn.Conv2d(out_channels // 2, out_channels, kernel_size=1),
+            nn.Sigmoid())
+
+    def _make_branch(self, in_channels, out_channels, dilation):
+        return nn.Sequential( BasicConv2d(in_channels, out_channels, kernel_size=1),
+            BasicConv2d(out_channels, out_channels, kernel_size=3, padding=1, dilation=1, groups=2),
+            BasicConv2d(out_channels, out_channels, kernel_size=3, padding=dilation, dilation=dilation, groups=2))
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        x3 = self.branch3(x)
+
+        out = torch.cat([x0, x1, x2, x3], dim=1)
+        out = self.conv_cat(out)
+        res = self.conv_res(x)
+
+        # Context-aware gating
+        global_feat = F.adaptive_avg_pool2d(out, 1)  # [B, C, 1, 1]
+        gate = self.gate_fc(global_feat)             # [B, C, 1, 1]
+
+        out = gate * out + (1 - gate) * res
+        return out
+
+
+class GeM(nn.Module):
+    def __init__(self, p=2, eps=1e-6):
+        super(GeM, self).__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), (x.size(-2), x.size(-1))).pow(1.0 / self.p)
+
+class GeMChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=8):
+        super(GeMChannelAttention, self).__init__()
+        self.gem_pool = GeM()
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        gem_out = self.gem_pool(x)
+        mlp_out = self.mlp(gem_out)
+        return self.sigmoid(mlp_out)
+
+class MultiKernelSpatialAttention(nn.Module):
+    def __init__(self):
+        super(MultiKernelSpatialAttention, self).__init__()
+        self.conv3 = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False)
+        self.conv5 = nn.Conv2d(2, 1, kernel_size=5, padding=2, bias=False)
+        self.conv7 = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = (self.conv3(x_cat) + self.conv5(x_cat) + self.conv7(x_cat)) / 3
+        return self.sigmoid(out)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=8):
+        super(CBAM, self).__init__()
+        self.channel_attention = GeMChannelAttention(in_planes, ratio)
+        self.spatial_attention = MultiKernelSpatialAttention()
+
+    def forward(self, x):
+        x = x * self.channel_attention(x)
+        x = x * self.spatial_attention(x)
+        return x
+
+
+
+class MyNetwork(nn.Module):
+    def __init__(self):
+        super(MyNetwork, self).__init__()
+
+        self.conv1_depthwise = nn.Conv2d(64, 64, kernel_size=3, padding=1, groups=64)
+        self.conv1_pointwise = nn.Conv2d(64, 64, kernel_size=1)
+
+        self.conv2_depthwise = nn.Conv2d(64, 64, kernel_size=3, padding=1, groups=64)
+        self.conv2_pointwise = nn.Conv2d(64, 32, kernel_size=1)
+
+        self.conv3_depthwise = nn.Conv2d(32, 32, kernel_size=3, padding=1, groups=32)
+        self.conv3_pointwise = nn.Conv2d(32, 16, kernel_size=1)
+
+        self.conv4_depthwise = nn.Conv2d(16, 16, kernel_size=3, padding=1, groups=16)
+        self.conv4_pointwise = nn.Conv2d(16, 8, kernel_size=1)
+
+        self.dropout = nn.Dropout(p=0.25)
+
+        self.adjust_conv2 = nn.Conv2d(64, 32, kernel_size=1)
+        self.adjust_conv3 = nn.Conv2d(32, 16, kernel_size=1)
+
+        self.final_conv = nn.Conv2d(24, 1, kernel_size=3,padding=1)
+
+    def forward(self, x):
+        x1 = self.conv1_depthwise(x)
+        x1 = self.conv1_pointwise(x1)
+        x1 = nn.ReLU()(x1)
+        x1 = self.dropout(x1)
+
+        x2 = self.conv2_depthwise(x1)
+        x2 = self.conv2_pointwise(x2)
+        x2 = nn.ReLU()(x2)
+        x2 = self.dropout(x2)
+        x2 = x2 + self.adjust_conv2(x1)
+
+        x3 = self.conv3_depthwise(x2)
+        x3 = self.conv3_pointwise(x3)
+        x3 = nn.ReLU()(x3)
+        x3 = self.dropout(x3)
+        x3 = x3 + self.adjust_conv3(x2)
+
+        x4 = self.conv4_depthwise(x3)
+        x4 = self.conv4_pointwise(x4)
+        x4 = nn.ReLU()(x4)
+        x4 = torch.cat((x4, x3), dim=1)
+
+        x = self.final_conv(x4)
+        return x
+
+
+
+
+
+#########################################################################
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dropout_prob=0.0):
+        super(DepthwiseSeparableConv, self).__init__()
+        
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=in_channels, bias=False)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.dropout = nn.Dropout2d(p=dropout_prob) if dropout_prob > 0 else nn.Identity()
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.bn1(x)
+        x = self.pointwise(x)
+        x = self.bn2(x)
+        x = self.dropout(x)
+        return x
+
+class FinalSegmentationModel(nn.Module):
+    def __init__(self, num_classes=1): 
+        super(FinalSegmentationModel, self).__init__()
+
+        self.swin_transformer = timm.create_model('swinv2_tiny_window16_256', pretrained=False, features_only=True
+                                                   ,out_indices=(0, 1, 2, 3),embed_dim=48 )
+        
+        self.swin56 = DepthwiseSeparableConv(48, 64, kernel_size=3, padding=1, dropout_prob=0.2)
+        self.swin28 = DepthwiseSeparableConv(96, 128, kernel_size=3, padding=1, dropout_prob=0.2)
+        self.swin14 = DepthwiseSeparableConv(192, 256, kernel_size=3, padding=1, dropout_prob=0.25)
+        self.swin7 = DepthwiseSeparableConv(384, 384, kernel_size=3, padding=1, dropout_prob=0.4)
+
+
+        self.upsample4 =nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.rfb4 = RFB_Block(640, 192)
+        self.cbam4 = CBAM(192)  
+        self.conv_decoder4 = nn.Sequential(nn.Conv2d(192, 192, kernel_size=3,padding=1), nn.BatchNorm2d(192), nn.GELU(),nn.Dropout(p=0.25))
+
+
+        self.upsample3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.rfb3 = RFB_Block(320, 128)
+        self.cbam3 = CBAM(128)  
+        self.conv_decoder3 = nn.Sequential(nn.Conv2d(128, 128, kernel_size=3,padding=1), nn.BatchNorm2d(128), nn.GELU(),nn.Dropout(p=0.25))
+
+
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.rfb2 = RFB_Block(192, 96)
+        self.cbam2 = CBAM(96)  
+        self.conv_decoder2 = nn.Sequential(nn.Conv2d(96, 96, kernel_size=3,padding=1), nn.BatchNorm2d(96), nn.GELU(),nn.Dropout (p=0.2))
+
+
+        self.upsample1= nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv_decoder1 = nn.Sequential(nn.Conv2d(96, 96, kernel_size=3,padding=1), nn.BatchNorm2d(96), nn.GELU(),nn.Dropout(p=0.1))
+
+
+        self.upsample0= nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv_decoder0 = nn.Sequential(nn.Conv2d(96, 64, kernel_size=3,padding=1), nn.BatchNorm2d(64), nn.GELU(),nn.Dropout(p=0.1))
+
+        self.final_conv= MyNetwork()
+
+    def forward(self, x):
+        features = self.swin_transformer(x)
+
+        features56 = features[-4].permute(0, 3, 1, 2)
+        features56 = self.swin56(features56)
+
+        features28 = features[-3].permute(0, 3, 1, 2)
+        features28 = self.swin28(features28)
+
+        features14 = features[-2].permute(0, 3, 1, 2)
+        features14 = self.swin14(features14)
+
+        convnext_features7 = features[-1].permute(0, 3, 1, 2)
+        convnext_features7 = self.swin7(convnext_features7)
+
+        d4 = self.upsample4(convnext_features7)
+        d4 = torch.cat([d4, features14], dim=1)
+        d4 = self.rfb4(d4)
+        d4 = self.cbam4(d4)  
+        d4 = self.conv_decoder4(d4)
+
+        d3 = self.upsample3(d4)
+        d3 = torch.cat([d3, features28], dim=1)
+        d3 = self.rfb3(d3)
+        d3 = self.cbam3(d3)  
+        d3 = self.conv_decoder3(d3)
+
+        d2 = self.upsample2(d3)
+        d2 = torch.cat([d2, features56], dim=1)
+        d2 = self.rfb2(d2)
+        d2 = self.cbam2(d2) 
+        d2 = self.conv_decoder2(d2)
+
+        d1 = self.upsample1(d2)
+        d1 = self.conv_decoder1(d1)
+
+        d0 = self.upsample0(d1)
+        d0 = self.conv_decoder0(d0)
+
+        return self.final_conv(d0)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+model = FinalSegmentationModel(num_classes=1).to(device)
+print("Model architecture:")
+print(model)
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+frozen_params = total_params - trainable_params
+
+print(f"Total parameters: {total_params}")
+print(f"Trainable parameters: {trainable_params}")
+print(f"Frozen parameters: {frozen_params}")
+optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=0.0001)
